@@ -48,6 +48,116 @@ def _normalize_date_digits(value: Any) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())[:8]
 
 
+def _parse_akshare_wide_table_to_periods(main_indicators: Any) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Parse AkShare main_indicators wide table into period-keyed statement records.
+    
+    Args:
+        main_indicators: List of dicts where each has '指标' (metric name) and date columns
+        
+    Returns:
+        dict: {period: {section_name: {field: value}}} where section_name is one of
+              'income_statement', 'balance_sheet', 'cashflow_statement', 'financial_indicators'
+    """
+    if not isinstance(main_indicators, list):
+        return {}
+    
+    # Define metric name mappings: Chinese name -> (section, field_name)
+    metric_mapping = {
+        # Income statement - revenue
+        "营业总收入": ("income_statement", "revenue"),
+        "营业收入": ("income_statement", "revenue"),
+        "total_revenue": ("income_statement", "revenue"),
+        # Income statement - profits
+        "归母净利润": ("income_statement", "n_income_attr_p"),
+        "净利润": ("income_statement", "n_income"),
+        "营业利润": ("income_statement", "operate_profit"),
+        "利润总额": ("income_statement", "total_profit"),
+        # Income statement - costs & expenses
+        "营业成本": ("income_statement", "oper_cost"),
+        "销售费用": ("income_statement", "sell_exp"),
+        "管理费用": ("income_statement", "admin_exp"),
+        "财务费用": ("income_statement", "fin_exp"),
+        "研发费用": ("income_statement", "rd_exp"),
+        # Balance sheet - assets
+        "总资产": ("balance_sheet", "total_assets"),
+        "流动资产合计": ("balance_sheet", "total_cur_assets"),
+        "非流动资产合计": ("balance_sheet", "total_nca"),
+        "货币资金": ("balance_sheet", "money_cap"),
+        "应收账款": ("balance_sheet", "accounts_receiv"),
+        "存货": ("balance_sheet", "inventories"),
+        "固定资产": ("balance_sheet", "fix_assets"),
+        # Balance sheet - liabilities & equity
+        "负债合计": ("balance_sheet", "total_liab"),
+        "流动负债合计": ("balance_sheet", "total_cur_liab"),
+        "非流动负债合计": ("balance_sheet", "total_ncl"),
+        "股东权益合计(净资产)": ("balance_sheet", "total_hldr_eqy_exc_min_int"),
+        "股东权益合计": ("balance_sheet", "total_hldr_eqy_exc_min_int"),
+        "所有者权益合计": ("balance_sheet", "total_hldr_eqy_exc_min_int"),
+        # Cash flow statement
+        "经营活动产生的现金流量净额": ("cashflow_statement", "n_cashflow_act"),
+        "投资活动产生的现金流量净额": ("cashflow_statement", "n_cashflow_inv_act"),
+        "筹资活动产生的现金流量净额": ("cashflow_statement", "n_cashflow_fin_act"),
+        "期末现金及现金等价物余额": ("cashflow_statement", "c_cash_equ_end_period"),
+        "期初现金及现金等价物余额": ("cashflow_statement", "c_cash_equ_beg_period"),
+        # Financial indicators
+        "净资产收益率_平均": ("financial_indicators", "roe"),
+        "净资产收益率(ROE)": ("financial_indicators", "roe"),
+        "净资产收益率": ("financial_indicators", "roe"),
+        "总资产收益率": ("financial_indicators", "roa"),
+        "资产负债率": ("financial_indicators", "debt_to_assets"),
+        "负债率": ("financial_indicators", "debt_to_assets"),
+        "毛利率": ("financial_indicators", "grossprofit_margin"),
+        "净利率": ("financial_indicators", "netprofit_margin"),
+        "销售净利率": ("financial_indicators", "netprofit_margin"),
+        "流动比率": ("financial_indicators", "current_ratio"),
+        "速动比率": ("financial_indicators", "quick_ratio"),
+        "现金比率": ("financial_indicators", "cash_ratio"),
+    }
+    
+    periods_data: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    
+    for row in main_indicators:
+        if not isinstance(row, dict):
+            continue
+            
+        # Get the metric name
+        metric_name = row.get("指标") or row.get("indicator") or ""
+        if not metric_name:
+            continue
+        
+        # Look up the mapping
+        mapping = metric_mapping.get(metric_name)
+        if not mapping:
+            continue
+            
+        section_name, field_name = mapping
+        
+        # Extract all date columns
+        for key, value in row.items():
+            if key in ("指标", "indicator", "选项"):
+                continue
+            
+            # Try to normalize as a date
+            period = _normalize_date_digits(key)
+            if not period or len(period) != 8:
+                continue
+            
+            # Convert value to float if possible
+            numeric_value = _safe_float(value)
+            if numeric_value is None:
+                continue
+            
+            # Store in the nested structure
+            if period not in periods_data:
+                periods_data[period] = {}
+            if section_name not in periods_data[period]:
+                periods_data[period][section_name] = {}
+            
+            periods_data[period][section_name][field_name] = numeric_value
+    
+    return periods_data
+
+
 def _pick_first(*values: Any) -> Any:
     for value in values:
         if value is not None:
@@ -222,6 +332,31 @@ def expand_financial_document_to_periods(document: Optional[Dict[str, Any]]) -> 
 
     raw_data = document.get("raw_data") or {}
     grouped: Dict[str, Dict[str, Any]] = {}
+    
+    # First, parse AkShare main_indicators wide table if present
+    main_indicators = raw_data.get("main_indicators")
+    if main_indicators:
+        akshare_periods = _parse_akshare_wide_table_to_periods(main_indicators)
+        for period, sections in akshare_periods.items():
+            period_entry = grouped.setdefault(period, {
+                "symbol": document.get("symbol") or document.get("code"),
+                "code": document.get("code") or document.get("symbol"),
+                "name": document.get("name"),
+                "data_source": document.get("data_source") or document.get("source"),
+                "source": document.get("data_source") or document.get("source"),
+                "report_period": period,
+                "report_date": period,
+                "report_type": _determine_report_type(period),
+                "ann_date": _normalize_date_digits(_pick_first(document.get("ann_date"))),
+                "updated_at": document.get("updated_at"),
+            })
+            # Merge sections from wide table
+            for section_name, fields in sections.items():
+                existing_section = period_entry.get(section_name) or {}
+                existing_section.update(fields)
+                period_entry[section_name] = existing_section
+    
+    # Then process Tushare-style statement lists
     section_names = [
         "income_statement",
         "balance_sheet",
