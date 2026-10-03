@@ -13,16 +13,91 @@ from typing import Dict, Any
 import json
 
 
+class _DocsCursor:
+    def __init__(self, docs):
+        self.data = list(docs or [])
+
+    def sort(self, *args, **kwargs):
+        return self
+
+    def limit(self, n):
+        self.data = self.data[:n]
+        return self
+
+    def __iter__(self):
+        return iter(self.data)
+
+
+class _DocsCollection:
+    def __init__(self, docs):
+        self.docs = list(docs or [])
+
+    def find_one(self, query=None, **kwargs):
+        return self.docs[0] if self.docs else None
+
+    def find(self, query=None, *args, **kwargs):
+        return _DocsCursor(self.docs)
+
+
+class _SplitMockDB:
+    def __init__(self, snapshot_docs, period_docs):
+        self.stock_financial_data = _DocsCollection(snapshot_docs)
+        self.financial_data_cache = _DocsCollection(snapshot_docs)
+        self.stock_financial_periods = _DocsCollection(period_docs)
+        self.stock_basic_info = _DocsCollection([])
+        self.market_quotes = _DocsCollection([])
+
+    def __getitem__(self, key):
+        return getattr(self, key, _DocsCollection([]))
+
+
+class _SplitMockClient:
+    def __init__(self, snapshot_docs, period_docs):
+        self._db = _SplitMockDB(snapshot_docs, period_docs)
+
+    def get_database(self, name):
+        return self._db
+
+
+def _patch_financial_db(monkeypatch, snapshot_docs, period_docs):
+    client = _SplitMockClient(snapshot_docs, period_docs)
+
+    monkeypatch.setattr(
+        "tradingagents.dataflows.cache.app_adapter.get_mongodb_client",
+        lambda: client,
+    )
+    monkeypatch.setattr(
+        "core.skill_runtime.data_access._get_db",
+        lambda: client.get_database("tradingagents"),
+    )
+    monkeypatch.setattr(
+        "core.skill_runtime.data_access._get_sources",
+        lambda market="a_shares": ["akshare"],
+    )
+    monkeypatch.setattr(
+        "core.skill_runtime.data_access.get_latest_stock_price",
+        lambda symbol: 5.50,
+    )
+    monkeypatch.setattr(
+        "core.skill_runtime.data_access.get_stock_basic_info",
+        lambda symbol: {"symbol": symbol, "name": "中国核电", "total_share": 1256000},
+    )
+    return client
+
+
 @pytest.fixture
 def akshare_financial_document_with_cashflow() -> Dict[str, Any]:
-    """模拟含现金流的 AkShare 格式财务文档"""
+    """Live AkShare shape: only main_indicators, short cash-flow label, no statements.
+
+    Intentionally omits cashflow_statement and report_type. A fixture that already
+    has those keys would not reproduce the 601985 live failure.
+    """
     return {
         "symbol": "601985",
         "code": "601985",
         "name": "中国核电",
         "data_source": "akshare",
-        "report_period": "20251231",
-        "report_type": "annual",
+        "report_period": "20260630",
         "updated_at": datetime.now(timezone.utc),
         "raw_data": {
             "main_indicators": [
@@ -76,7 +151,7 @@ def akshare_financial_document_with_cashflow() -> Dict[str, Any]:
                     "20241231": "60.9",
                 },
                 {
-                    "指标": "经营活动产生的现金流量净额",
+                    "指标": "经营现金流量净额",
                     "20251231": "25000000000",
                     "20250930": "18000000000",
                     "20250630": "12000000000",
@@ -190,24 +265,36 @@ def mock_mongodb_collection(akshare_financial_document_with_cashflow):
 
 
 @pytest.fixture
-def mock_mongodb_client(mock_mongodb_collection):
-    """模拟 MongoDB 客户端"""
+def mock_mongodb_client(akshare_financial_document_with_cashflow):
+    """Live Mongo split: snapshot is the wide table; periods is one quarterly row."""
+    quarterly_stub = {
+        "symbol": "601985",
+        "code": "601985",
+        "name": "中国核电",
+        "source": "akshare",
+        "data_source": "akshare",
+        "report_period": "20260630",
+        "report_date": "20260630",
+        "report_type": "quarterly",
+    }
+    snapshot_col = _DocsCollection([akshare_financial_document_with_cashflow])
+    period_col = _DocsCollection([quarterly_stub])
+
     class MockDB:
         def __init__(self):
-            self.stock_financial_data = mock_mongodb_collection
-            self.financial_data_cache = mock_mongodb_collection
-            self.stock_financial_periods = mock_mongodb_collection
-            self.stock_basic_info = mock_mongodb_collection
-            self.market_quotes = mock_mongodb_collection
-        
+            self.stock_financial_data = snapshot_col
+            self.financial_data_cache = snapshot_col
+            self.stock_financial_periods = period_col
+            self.stock_basic_info = _DocsCollection([])
+            self.market_quotes = _DocsCollection([])
+
         def __getitem__(self, key):
-            # Support db['collection_name'] syntax
-            return getattr(self, key, mock_mongodb_collection)
-    
+            return getattr(self, key, _DocsCollection([]))
+
     class MockClient:
         def get_database(self, name):
             return MockDB()
-    
+
     return MockClient()
 
 
@@ -230,9 +317,16 @@ def test_cash_flow_statement_reads_akshare_data(monkeypatch, mock_mongodb_client
         'core.skill_runtime.data_access._get_db',
         mock_get_db
     )
+    monkeypatch.setattr(
+        'core.skill_runtime.data_access._get_sources',
+        lambda market="a_shares": ["akshare"],
+    )
     
     from core.tools.implementations.fundamentals.stock_fundamentals import get_cash_flow_statement
-    
+
+    assert "cashflow_statement" not in akshare_financial_document_with_cashflow["raw_data"]
+    assert "report_type" not in akshare_financial_document_with_cashflow
+
     result = get_cash_flow_statement.invoke({"ticker": "601985", "limit": 4})
     
     # 不应返回"暂未获取到"错误
@@ -267,6 +361,10 @@ def test_dcf_recognizes_annual_periods(monkeypatch, mock_mongodb_client, akshare
     monkeypatch.setattr(
         'core.skill_runtime.data_access._get_db',
         mock_get_db
+    )
+    monkeypatch.setattr(
+        'core.skill_runtime.data_access._get_sources',
+        lambda market="a_shares": ["akshare"],
     )
     
     # Mock get_latest_stock_price to return a valid price
@@ -409,6 +507,10 @@ def test_financial_periods_api_returns_annual_records(monkeypatch, mock_mongodb_
         'core.skill_runtime.data_access._get_db',
         mock_get_db
     )
+    monkeypatch.setattr(
+        'core.skill_runtime.data_access._get_sources',
+        lambda market="a_shares": ["akshare"],
+    )
     
     from core.skill_runtime.data_access import get_stock_financial_periods
     
@@ -482,6 +584,10 @@ def test_short_cashflow_label_in_analyst_tool(monkeypatch, akshare_financial_doc
         'core.skill_runtime.data_access._get_db',
         mock_get_db
     )
+    monkeypatch.setattr(
+        'core.skill_runtime.data_access._get_sources',
+        lambda market="a_shares": ["akshare"],
+    )
     
     from core.tools.implementations.fundamentals.stock_fundamentals import get_cash_flow_statement
     
@@ -552,78 +658,6 @@ def _live_quarterly_period_stub() -> Dict[str, Any]:
         "report_date": "20260630",
         "report_type": "quarterly",
     }
-
-
-class _DocsCursor:
-    def __init__(self, docs):
-        self.data = list(docs or [])
-
-    def sort(self, *args, **kwargs):
-        return self
-
-    def limit(self, n):
-        self.data = self.data[:n]
-        return self
-
-    def __iter__(self):
-        return iter(self.data)
-
-
-class _DocsCollection:
-    def __init__(self, docs):
-        self.docs = list(docs or [])
-
-    def find_one(self, query=None, **kwargs):
-        return self.docs[0] if self.docs else None
-
-    def find(self, query=None, *args, **kwargs):
-        return _DocsCursor(self.docs)
-
-
-class _SplitMockDB:
-    def __init__(self, snapshot_docs, period_docs):
-        self.stock_financial_data = _DocsCollection(snapshot_docs)
-        self.financial_data_cache = _DocsCollection(snapshot_docs)
-        self.stock_financial_periods = _DocsCollection(period_docs)
-        self.stock_basic_info = _DocsCollection([])
-        self.market_quotes = _DocsCollection([])
-
-    def __getitem__(self, key):
-        return getattr(self, key, _DocsCollection([]))
-
-
-class _SplitMockClient:
-    def __init__(self, snapshot_docs, period_docs):
-        self._db = _SplitMockDB(snapshot_docs, period_docs)
-
-    def get_database(self, name):
-        return self._db
-
-
-def _patch_financial_db(monkeypatch, snapshot_docs, period_docs):
-    client = _SplitMockClient(snapshot_docs, period_docs)
-
-    monkeypatch.setattr(
-        "tradingagents.dataflows.cache.app_adapter.get_mongodb_client",
-        lambda: client,
-    )
-    monkeypatch.setattr(
-        "core.skill_runtime.data_access._get_db",
-        lambda: client.get_database("tradingagents"),
-    )
-    monkeypatch.setattr(
-        "core.skill_runtime.data_access._get_sources",
-        lambda market="a_shares": ["akshare"],
-    )
-    monkeypatch.setattr(
-        "core.skill_runtime.data_access.get_latest_stock_price",
-        lambda symbol: 5.50,
-    )
-    monkeypatch.setattr(
-        "core.skill_runtime.data_access.get_stock_basic_info",
-        lambda symbol: {"symbol": symbol, "name": "中国核电", "total_share": 1256000},
-    )
-    return client
 
 
 def test_expand_wide_table_only_maps_short_cashflow_label():
