@@ -88,6 +88,79 @@ def akshare_financial_document_with_cashflow() -> Dict[str, Any]:
 
 
 @pytest.fixture
+def akshare_financial_document_with_short_cashflow_label() -> Dict[str, Any]:
+    """模拟实际 AkShare 数据使用短标签（经营现金流量净额）而非长标签"""
+    return {
+        "symbol": "601985",
+        "code": "601985",
+        "name": "中国核电",
+        "data_source": "akshare",
+        "report_period": "20251231",
+        "updated_at": datetime.now(timezone.utc),
+        "raw_data": {
+            "main_indicators": [
+                {
+                    "指标": "营业收入",
+                    "20251231": "82075000000",
+                    "20250930": "60000000000",
+                    "20250630": "38398000000",
+                    "20241231": "75000000000",
+                },
+                {
+                    "指标": "净利润",
+                    "20251231": "9304000000",
+                    "20250930": "7000000000",
+                    "20250630": "3641000000",
+                    "20241231": "8500000000",
+                },
+                {
+                    "指标": "总资产",
+                    "20251231": "500000000000",
+                    "20250930": "480000000000",
+                    "20250630": "470000000000",
+                    "20241231": "460000000000",
+                },
+                {
+                    "指标": "负债合计",
+                    "20251231": "300000000000",
+                    "20250930": "290000000000",
+                    "20250630": "285000000000",
+                    "20241231": "280000000000",
+                },
+                {
+                    "指标": "股东权益合计",
+                    "20251231": "200000000000",
+                    "20250930": "190000000000",
+                    "20250630": "185000000000",
+                    "20241231": "180000000000",
+                },
+                {
+                    "指标": "净资产收益率(ROE)",
+                    "20251231": "8.21",
+                    "20250930": "5.8",
+                    "20250630": "3.05",
+                    "20241231": "7.5",
+                },
+                {
+                    "指标": "资产负债率",
+                    "20251231": "60.0",
+                    "20250930": "60.4",
+                    "20250630": "70.45",
+                    "20241231": "60.9",
+                },
+                {
+                    "指标": "经营现金流量净额",  # 短标签，实际 AkShare 使用
+                    "20251231": "25000000000",
+                    "20250930": "18000000000",
+                    "20250630": "12000000000",
+                    "20241231": "22000000000",
+                },
+            ]
+        }
+    }
+
+
+@pytest.fixture
 def mock_mongodb_collection(akshare_financial_document_with_cashflow):
     """模拟 MongoDB 集合"""
     class MockCursor:
@@ -353,5 +426,306 @@ def test_financial_periods_api_returns_annual_records(monkeypatch, mock_mongodb_
         assert ap.get('report_type') == 'annual', f"年报期应标记为 annual: {ap.get('report_period')}"
 
 
+def test_short_cashflow_label_in_analyst_tool(monkeypatch, akshare_financial_document_with_short_cashflow_label):
+    """测试 get_cash_flow_statement 识别短标签经营现金流量净额"""
+    class MockCursor:
+        def __init__(self, data):
+            self.data = [data] if data else []
+        
+        def sort(self, *args, **kwargs):
+            return self
+        
+        def limit(self, n):
+            return self
+        
+        def __iter__(self):
+            return iter(self.data)
+        
+        def to_list(self, length=None):
+            return self.data
+    
+    class MockCollection:
+        def find_one(self, query, **kwargs):
+            return akshare_financial_document_with_short_cashflow_label
+        
+        def find(self, query, *args, **kwargs):
+            return MockCursor(akshare_financial_document_with_short_cashflow_label)
+    
+    class MockDB:
+        def __init__(self):
+            self.stock_financial_data = MockCollection()
+            self.financial_data_cache = MockCollection()
+            self.stock_financial_periods = MockCollection()
+            self.stock_basic_info = MockCollection()
+            self.market_quotes = MockCollection()
+        
+        def __getitem__(self, key):
+            return getattr(self, key, MockCollection())
+    
+    class MockClient:
+        def get_database(self, name):
+            return MockDB()
+    
+    mock_client = MockClient()
+    
+    def mock_get_client():
+        return mock_client
+    
+    def mock_get_db():
+        return mock_client.get_database('tradingagents')
+    
+    monkeypatch.setattr(
+        'tradingagents.dataflows.cache.app_adapter.get_mongodb_client',
+        mock_get_client
+    )
+    monkeypatch.setattr(
+        'core.skill_runtime.data_access._get_db',
+        mock_get_db
+    )
+    
+    from core.tools.implementations.fundamentals.stock_fundamentals import get_cash_flow_statement
+    
+    result = get_cash_flow_statement.invoke({"ticker": "601985", "limit": 4})
+    
+    # 不应返回"暂未获取到"错误
+    assert "暂未获取到最近季度现金流量表数据" not in result, f"现金流量表应有数据（短标签），但得到：{result[:200]}"
+    
+    # 应包含经营活动现金流量净额数据
+    assert "经营活动现金流量净额" in result or "n_cashflow_act" in result, f"应包含现金流数据，结果：{result[:500]}"
+    
+    # 应包含至少一个报告期
+    assert "2025" in result or "20251231" in result or "2025-12-31" in result
+
+
+def test_short_cashflow_label_in_dcf(monkeypatch, akshare_financial_document_with_short_cashflow_label):
+    """测试 DCF 估值识别短标签经营现金流量净额"""
+    class MockCursor:
+        def __init__(self, data):
+            self.data = [data] if data else []
+        
+        def sort(self, *args, **kwargs):
+            return self
+        
+        def limit(self, n):
+            return self
+        
+        def __iter__(self):
+            return iter(self.data)
+        
+        def to_list(self, length=None):
+            return self.data
+    
+    class MockCollection:
+        def find_one(self, query, **kwargs):
+            return akshare_financial_document_with_short_cashflow_label
+        
+        def find(self, query, *args, **kwargs):
+            return MockCursor(akshare_financial_document_with_short_cashflow_label)
+    
+    class MockDB:
+        def __init__(self):
+            self.stock_financial_data = MockCollection()
+            self.financial_data_cache = MockCollection()
+            self.stock_financial_periods = MockCollection()
+            self.stock_basic_info = MockCollection()
+            self.market_quotes = MockCollection()
+        
+        def __getitem__(self, key):
+            return getattr(self, key, MockCollection())
+    
+    class MockClient:
+        def get_database(self, name):
+            return MockDB()
+    
+    mock_client = MockClient()
+    
+    def mock_get_client():
+        return mock_client
+    
+    def mock_get_db():
+        return mock_client.get_database('tradingagents')
+    
+    def mock_get_price(symbol):
+        return 5.50
+    
+    def mock_get_basic_info(symbol):
+        return {
+            "symbol": symbol,
+            "name": "中国核电",
+            "total_share": 1256000,  # 万股
+        }
+    
+    monkeypatch.setattr(
+        'tradingagents.dataflows.cache.app_adapter.get_mongodb_client',
+        mock_get_client
+    )
+    monkeypatch.setattr(
+        'core.skill_runtime.data_access._get_db',
+        mock_get_db
+    )
+    monkeypatch.setattr(
+        'core.skill_runtime.data_access.get_latest_stock_price',
+        mock_get_price
+    )
+    monkeypatch.setattr(
+        'core.skill_runtime.data_access.get_stock_basic_info',
+        mock_get_basic_info
+    )
+    
+    from core.tools.implementations.fundamentals.valuation.dcf_valuation import get_dcf_valuation
+    
+    result_str = get_dcf_valuation.invoke({"symbol": "601985"})
+    result = json.loads(result_str)
+    
+    # 不应返回"可用年报数据不足"错误
+    assert result.get("status") != "error" or "期" not in result.get("message", ""), \
+        f"DCF 应成功识别年报期（短标签），但得到错误：{result.get('message')}"
+    
+    # 应至少有 2 个年报期
+    if result.get("status") != "error":
+        data_quality = result.get("data_quality", {})
+        years_available = data_quality.get("years_available", 0)
+        assert years_available >= 2, f"应至少有 2 个年报期（短标签），实际 {years_available}"
+
+
+def test_wide_table_only_no_prefilled_statements(monkeypatch):
+    """测试纯宽表格式，raw_data 只有 main_indicators，无预填充 cashflow_statement"""
+    wide_table_only_doc = {
+        "symbol": "601985",
+        "code": "601985",
+        "name": "中国核电",
+        "data_source": "akshare",
+        "report_period": "20251231",
+        "updated_at": datetime.now(timezone.utc),
+        "raw_data": {
+            # 仅有宽表，无其他预填充的 statement 列表
+            "main_indicators": [
+                {
+                    "指标": "营业收入",
+                    "20251231": "82075000000",
+                    "20241231": "75000000000",
+                    "20231231": "68000000000",
+                },
+                {
+                    "指标": "净利润",
+                    "20251231": "9304000000",
+                    "20241231": "8500000000",
+                    "20231231": "7800000000",
+                },
+                {
+                    "指标": "经营现金流量净额",  # 只有此行，无投资/筹资
+                    "20251231": "25000000000",
+                    "20241231": "22000000000",
+                    "20231231": "20000000000",
+                },
+            ]
+        }
+    }
+    
+    class MockCursor:
+        def __init__(self, data):
+            self.data = [data] if data else []
+        
+        def sort(self, *args, **kwargs):
+            return self
+        
+        def limit(self, n):
+            return self
+        
+        def __iter__(self):
+            return iter(self.data)
+        
+        def to_list(self, length=None):
+            return self.data
+    
+    class MockCollection:
+        def find_one(self, query, **kwargs):
+            return wide_table_only_doc
+        
+        def find(self, query, *args, **kwargs):
+            return MockCursor(wide_table_only_doc)
+    
+    class MockDB:
+        def __init__(self):
+            self.stock_financial_data = MockCollection()
+            self.financial_data_cache = MockCollection()
+            self.stock_financial_periods = MockCollection()
+            self.stock_basic_info = MockCollection()
+            self.market_quotes = MockCollection()
+        
+        def __getitem__(self, key):
+            return getattr(self, key, MockCollection())
+    
+    class MockClient:
+        def get_database(self, name):
+            return MockDB()
+    
+    mock_client = MockClient()
+    
+    def mock_get_client():
+        return mock_client
+    
+    def mock_get_db():
+        return mock_client.get_database('tradingagents')
+    
+    def mock_get_price(symbol):
+        return 5.50
+    
+    def mock_get_basic_info(symbol):
+        return {
+            "symbol": symbol,
+            "name": "中国核电",
+            "total_share": 1256000,
+        }
+    
+    monkeypatch.setattr(
+        'tradingagents.dataflows.cache.app_adapter.get_mongodb_client',
+        mock_get_client
+    )
+    monkeypatch.setattr(
+        'core.skill_runtime.data_access._get_db',
+        mock_get_db
+    )
+    monkeypatch.setattr(
+        'core.skill_runtime.data_access.get_latest_stock_price',
+        mock_get_price
+    )
+    monkeypatch.setattr(
+        'core.skill_runtime.data_access.get_stock_basic_info',
+        mock_get_basic_info
+    )
+    
+    from core.tools.implementations.fundamentals.stock_fundamentals import get_cash_flow_statement
+    from core.tools.implementations.fundamentals.valuation.dcf_valuation import get_dcf_valuation
+    from core.skill_runtime.data_access import get_stock_financial_periods
+    
+    # 1. 测试现金流工具
+    cash_result = get_cash_flow_statement.invoke({"ticker": "601985", "limit": 3})
+    assert "暂未获取到最近季度现金流量表数据" not in cash_result, \
+        f"纯宽表应能读取现金流，但得到：{cash_result[:200]}"
+    assert "经营活动现金流量净额" in cash_result or "n_cashflow_act" in cash_result
+    
+    # 不应虚构投资/筹资现金流
+    assert "投资活动" not in cash_result or "N/A" in cash_result or "暂无" in cash_result, \
+        "不应虚构投资现金流"
+    
+    # 2. 测试 get_stock_financial_periods 识别年报
+    periods = get_stock_financial_periods("601985", limit=10)
+    annual_periods = [p for p in periods if str(p.get('report_period', '')).endswith('1231')]
+    assert len(annual_periods) >= 2, f"纯宽表应识别年报期，实际 {len(annual_periods)} 个"
+    
+    for ap in annual_periods:
+        assert ap.get('report_type') == 'annual', \
+            f"年报期 {ap.get('report_period')} 应标记为 annual"
+    
+    # 3. 测试 DCF 估值
+    dcf_result_str = get_dcf_valuation.invoke({"symbol": "601985"})
+    dcf_result = json.loads(dcf_result_str)
+    
+    assert dcf_result.get("status") != "error" or "期" not in dcf_result.get("message", ""), \
+        f"纯宽表 DCF 应成功，但得到错误：{dcf_result.get('message')}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+

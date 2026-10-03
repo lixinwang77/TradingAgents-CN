@@ -95,6 +95,7 @@ def _parse_akshare_wide_table_to_periods(main_indicators: Any) -> Dict[str, Dict
         "所有者权益合计": ("balance_sheet", "total_hldr_eqy_exc_min_int"),
         # Cash flow statement
         "经营活动产生的现金流量净额": ("cashflow_statement", "n_cashflow_act"),
+        "经营现金流量净额": ("cashflow_statement", "n_cashflow_act"),
         "投资活动产生的现金流量净额": ("cashflow_statement", "n_cashflow_inv_act"),
         "筹资活动产生的现金流量净额": ("cashflow_statement", "n_cashflow_fin_act"),
         "期末现金及现金等价物余额": ("cashflow_statement", "c_cash_equ_end_period"),
