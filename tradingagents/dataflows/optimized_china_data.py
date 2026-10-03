@@ -2453,40 +2453,39 @@ def _add_financial_cache_methods():
             # 从 raw_data 中提取各报表
             raw_data = period_record.get('raw_data', {})
             
+            # 共用字段：报告期、公告日期、报告类型
+            common_fields = {
+                'end_date': report_period,
+                'report_period': report_period,
+                'report_date': report_period,
+            }
+            if period_record.get('ann_date'):
+                common_fields['ann_date'] = period_record['ann_date']
+            if period_record.get('report_type'):
+                common_fields['report_type'] = period_record['report_type']
+            
             # 利润表
             if 'income_statement' in raw_data and raw_data['income_statement']:
                 income_stmt = dict(raw_data['income_statement'])
-                income_stmt['end_date'] = report_period
-                income_stmt['report_period'] = report_period
-                if 'ann_date' not in income_stmt and period_record.get('ann_date'):
-                    income_stmt['ann_date'] = period_record['ann_date']
+                income_stmt.update(common_fields)
                 income_statements.append(income_stmt)
             
             # 资产负债表
             if 'balance_sheet' in raw_data and raw_data['balance_sheet']:
                 balance = dict(raw_data['balance_sheet'])
-                balance['end_date'] = report_period
-                balance['report_period'] = report_period
-                if 'ann_date' not in balance and period_record.get('ann_date'):
-                    balance['ann_date'] = period_record['ann_date']
+                balance.update(common_fields)
                 balance_sheets.append(balance)
             
             # 现金流量表
             if 'cashflow_statement' in raw_data and raw_data['cashflow_statement']:
                 cashflow = dict(raw_data['cashflow_statement'])
-                cashflow['end_date'] = report_period
-                cashflow['report_period'] = report_period
-                if 'ann_date' not in cashflow and period_record.get('ann_date'):
-                    cashflow['ann_date'] = period_record['ann_date']
+                cashflow.update(common_fields)
                 cash_flows.append(cashflow)
             
             # 财务指标
             if 'financial_indicators' in raw_data and raw_data['financial_indicators']:
                 indicator = dict(raw_data['financial_indicators'])
-                indicator['end_date'] = report_period
-                indicator['report_period'] = report_period
-                if 'ann_date' not in indicator and period_record.get('ann_date'):
-                    indicator['ann_date'] = period_record['ann_date']
+                indicator.update(common_fields)
                 financial_indicators.append(indicator)
         
         return {
