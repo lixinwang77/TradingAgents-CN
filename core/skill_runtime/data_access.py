@@ -95,6 +95,7 @@ def _parse_akshare_wide_table_to_periods(main_indicators: Any) -> Dict[str, Dict
         "所有者权益合计": ("balance_sheet", "total_hldr_eqy_exc_min_int"),
         # Cash flow statement
         "经营活动产生的现金流量净额": ("cashflow_statement", "n_cashflow_act"),
+        "经营现金流量净额": ("cashflow_statement", "n_cashflow_act"),
         "投资活动产生的现金流量净额": ("cashflow_statement", "n_cashflow_inv_act"),
         "筹资活动产生的现金流量净额": ("cashflow_statement", "n_cashflow_fin_act"),
         "期末现金及现金等价物余额": ("cashflow_statement", "c_cash_equ_end_period"),
@@ -432,6 +433,101 @@ def expand_financial_document_to_periods(document: Optional[Dict[str, Any]]) -> 
         reverse=True,
     )
     return records
+
+
+def _has_akshare_wide_table(document: Optional[Dict[str, Any]]) -> bool:
+    """Return True when raw_data.main_indicators is still an AkShare wide table."""
+    if not isinstance(document, dict):
+        return False
+    raw = document.get("raw_data")
+    if not isinstance(raw, dict):
+        return False
+    indicators = raw.get("main_indicators")
+    if not isinstance(indicators, list) or not indicators:
+        return False
+    first = indicators[0]
+    if not isinstance(first, dict):
+        return False
+    if "指标" not in first and "indicator" not in first:
+        return False
+    for key in first.keys():
+        if key in ("指标", "indicator", "选项"):
+            continue
+        if len(_normalize_date_digits(key)) == 8:
+            return True
+    return False
+
+
+def _record_is_annual(record: Dict[str, Any]) -> bool:
+    period = _normalize_date_digits(record.get("report_period") or record.get("report_date"))
+    if period.endswith("1231"):
+        return True
+    return str(record.get("report_type") or "").lower() == "annual"
+
+
+def _dedupe_sort_limit_periods(
+    records: List[Dict[str, Any]],
+    candidate_source: Optional[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    deduped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for item in records:
+        key = (
+            str(item.get("source") or item.get("data_source") or candidate_source or ""),
+            str(item.get("report_period") or item.get("report_date") or ""),
+            str(item.get("ann_date") or ""),
+        )
+        existing = deduped.get(key)
+        if existing is None or _statement_quality_score(item) >= _statement_quality_score(existing):
+            deduped[key] = item
+    result = list(deduped.values())
+    result.sort(
+        key=lambda item: (
+            str(item.get("report_period") or item.get("report_date") or ""),
+            str(item.get("ann_date") or ""),
+        ),
+        reverse=True,
+    )
+    return result[:limit]
+
+
+def _materialize_period_documents(documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    materialized: List[Dict[str, Any]] = []
+    for document in documents:
+        if _has_akshare_wide_table(document):
+            materialized.extend(expand_financial_document_to_periods(document))
+        else:
+            materialized.append(document)
+    return materialized
+
+
+def _expand_snapshot_documents(documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    expanded: List[Dict[str, Any]] = []
+    for document in documents:
+        expanded.extend(expand_financial_document_to_periods(document))
+    return expanded
+
+
+def _select_richer_period_records(
+    period_records: List[Dict[str, Any]],
+    snapshot_records: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Prefer snapshot expansion when it exposes more annual 1231 periods.
+
+    Live AkShare stores the wide table on stock_financial_data. A single
+    quarterly row in stock_financial_periods must not hide that series.
+    """
+    if not snapshot_records:
+        return period_records
+    if not period_records:
+        return snapshot_records
+    annual_periods = sum(1 for record in period_records if _record_is_annual(record))
+    annual_snapshots = sum(1 for record in snapshot_records if _record_is_annual(record))
+    if annual_snapshots > annual_periods:
+        return snapshot_records
+    if annual_periods == 0 and len(snapshot_records) > len(period_records):
+        return snapshot_records
+    return period_records
 
 
 def _query_financial_period_documents(symbol: str, source: Optional[str], limit: int) -> List[Dict[str, Any]]:
@@ -828,53 +924,34 @@ def get_stock_financial_periods(
     """
     symbol = str(symbol).strip().zfill(6)
 
+    def _collect(source_filter: Optional[str]) -> List[Dict[str, Any]]:
+        period_docs = _query_financial_period_documents(symbol, source_filter, limit)
+        snapshot_docs = _query_financial_snapshot_documents(symbol, source_filter, max(limit, 8))
+        chosen = _select_richer_period_records(
+            _materialize_period_documents(period_docs),
+            _expand_snapshot_documents(snapshot_docs),
+        )
+        if not chosen:
+            return []
+        return _dedupe_sort_limit_periods(chosen, source_filter, limit)
+
     candidate_sources = [source] if source else _get_sources()
+    fallback_without_annual: List[Dict[str, Any]] = []
     for candidate_source in candidate_sources:
-        period_docs = _query_financial_period_documents(symbol, candidate_source, limit)
-        if period_docs:
-            return period_docs
+        records = _collect(candidate_source)
+        if not records:
+            continue
+        if any(_record_is_annual(record) for record in records):
+            return records
+        if not fallback_without_annual:
+            fallback_without_annual = records
 
-        snapshot_docs = _query_financial_snapshot_documents(symbol, candidate_source, max(limit, 8))
-        expanded: List[Dict[str, Any]] = []
-        for document in snapshot_docs:
-            expanded.extend(expand_financial_document_to_periods(document))
-        if expanded:
-            deduped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-            for item in expanded:
-                key = (
-                    str(item.get("source") or item.get("data_source") or candidate_source or ""),
-                    str(item.get("report_period") or item.get("report_date") or ""),
-                    str(item.get("ann_date") or ""),
-                )
-                existing = deduped.get(key)
-                if existing is None or _statement_quality_score(item) >= _statement_quality_score(existing):
-                    deduped[key] = item
-            records = list(deduped.values())
-            records.sort(
-                key=lambda item: (
-                    str(item.get("report_period") or item.get("report_date") or ""),
-                    str(item.get("ann_date") or ""),
-                ),
-                reverse=True,
-            )
-            return records[:limit]
-
-    fallback_docs = _query_financial_period_documents(symbol, None, limit)
-    if fallback_docs:
-        return fallback_docs
-
-    snapshot_docs = _query_financial_snapshot_documents(symbol, None, max(limit, 8))
-    expanded: List[Dict[str, Any]] = []
-    for document in snapshot_docs:
-        expanded.extend(expand_financial_document_to_periods(document))
-    expanded.sort(
-        key=lambda item: (
-            str(item.get("report_period") or item.get("report_date") or ""),
-            str(item.get("ann_date") or ""),
-        ),
-        reverse=True,
-    )
-    return expanded[:limit]
+    unfiltered = _collect(None)
+    if unfiltered and any(_record_is_annual(record) for record in unfiltered):
+        return unfiltered
+    if fallback_without_annual:
+        return fallback_without_annual
+    return unfiltered
 
 
 def get_industry_peer_basic_info(

@@ -2383,6 +2383,7 @@ def _add_financial_cache_methods():
             '净资产收益率': ('roe', 'financial_indicators'),
             '资产负债率': ('debt_to_assets', 'financial_indicators'),
             '经营活动产生的现金流量净额': ('n_cashflow_act', 'cashflow_statement'),
+            '经营现金流量净额': ('n_cashflow_act', 'cashflow_statement'),
         }
         
         for record in main_indicators:
