@@ -2216,6 +2216,8 @@ def _add_financial_cache_methods():
         """从数据库缓存获取原始财务数据"""
         try:
             from .cache.app_adapter import get_mongodb_client
+            from core.skill_runtime.data_access import expand_financial_document_to_periods
+            
             client = get_mongodb_client()
             if not client:
                 logger.debug(f"📊 [财务缓存] MongoDB客户端不可用")
@@ -2236,9 +2238,40 @@ def _add_financial_cache_methods():
 
             if financial_doc:
                 logger.info(f"✅ [财务数据] 从 stock_financial_data 集合获取{symbol}财务数据")
-                # 将数据库文档转换为财务数据格式
+                
+                # 检查是否需要展开（AkShare 宽表格式）
+                raw_data = financial_doc.get('raw_data')
+                needs_pivot = False
+                
+                # 检查 raw_data.main_indicators 是否是 AkShare 宽表格式
+                if raw_data and isinstance(raw_data, dict):
+                    main_indicators = raw_data.get('main_indicators')
+                    if main_indicators and isinstance(main_indicators, list) and main_indicators:
+                        first_record = main_indicators[0]
+                        # 检查是否是 AkShare 宽表格式：有 '指标' 键，且有其他列名是日期格式（8位数字）
+                        if isinstance(first_record, dict) and '指标' in first_record:
+                            date_columns = [k for k in first_record.keys() if k != '指标' and 
+                                          len(str(k).replace('-', '').strip()) == 8 and 
+                                          str(k).replace('-', '').strip().isdigit()]
+                            if date_columns:
+                                needs_pivot = True
+                                logger.info(f"📊 [财务数据] 检测到{symbol}为AkShare宽表格式，将转换并展开")
+                
+                if needs_pivot:
+                    # 转换宽表格式为按期格式，然后展开
+                    pivoted_doc = self._pivot_akshare_wide_table(financial_doc)
+                    expanded_periods = expand_financial_document_to_periods(pivoted_doc)
+                    
+                    if expanded_periods:
+                        # 将展开后的记录按期聚合回财务数据格式
+                        financial_data = self._aggregate_periods_to_financial_data(expanded_periods)
+                        if financial_data:
+                            logger.info(f"📊 [财务数据] 成功展开{symbol}的财务数据为{len(expanded_periods)}个报告期，包含字段: {list(financial_data.keys())}")
+                            return financial_data
+                
+                # 如果不需要展开，或展开失败，回退到原逻辑（Tushare 格式直接提取）
                 financial_data = {}
-
+                
                 # 提取各类财务数据
                 # 第一优先级：检查 raw_data 字段（Tushare 同步服务使用的结构）
                 if 'raw_data' in financial_doc and isinstance(financial_doc['raw_data'], dict):
@@ -2313,6 +2346,155 @@ def _add_financial_cache_methods():
             logger.debug(f"📊 [财务缓存] 获取{symbol}原始财务数据缓存失败: {e}")
 
         return None
+    
+    def _pivot_akshare_wide_table(self, document: dict) -> dict:
+        """将 AkShare 宽表格式转换为按期记录格式"""
+        raw_data = document.get('raw_data', {})
+        main_indicators = raw_data.get('main_indicators', [])
+        
+        if not main_indicators:
+            return document
+        
+        # 收集所有日期列
+        date_columns = set()
+        for record in main_indicators:
+            if isinstance(record, dict):
+                for key in record.keys():
+                    if key != '指标':
+                        normalized = str(key).replace('-', '').strip()
+                        if len(normalized) == 8 and normalized.isdigit():
+                            date_columns.add(normalized)
+        
+        # 按期重组数据
+        periods_data = {}
+        for period in date_columns:
+            periods_data[period] = {}
+        
+        # 遍历每个指标行，提取各期数值
+        indicator_field_mapping = {
+            '营业收入': ('revenue', 'income_statement'),
+            '营业总收入': ('revenue', 'income_statement'),
+            '净利润': ('net_income', 'income_statement'),
+            '归母净利润': ('n_income_attr_p', 'income_statement'),
+            '总资产': ('total_assets', 'balance_sheet'),
+            '负债合计': ('total_liab', 'balance_sheet'),
+            '股东权益合计': ('total_hldr_eqy_exc_min_int', 'balance_sheet'),
+            '净资产收益率(ROE)': ('roe', 'financial_indicators'),
+            '净资产收益率': ('roe', 'financial_indicators'),
+            '资产负债率': ('debt_to_assets', 'financial_indicators'),
+            '经营活动产生的现金流量净额': ('n_cashflow_act', 'cashflow_statement'),
+        }
+        
+        for record in main_indicators:
+            if not isinstance(record, dict):
+                continue
+            
+            indicator_name = record.get('指标', '').strip()
+            if not indicator_name or indicator_name not in indicator_field_mapping:
+                continue
+            
+            field_name, statement_type = indicator_field_mapping[indicator_name]
+            
+            for period in date_columns:
+                # 尝试多种列名格式
+                value = None
+                for key in record.keys():
+                    if key == '指标':
+                        continue
+                    normalized_key = str(key).replace('-', '').strip()
+                    if normalized_key == period:
+                        value = record[key]
+                        break
+                
+                if value is not None and value != '':
+                    try:
+                        numeric_value = float(str(value).replace(',', ''))
+                        if statement_type not in periods_data[period]:
+                            periods_data[period][statement_type] = {}
+                        periods_data[period][statement_type][field_name] = numeric_value
+                    except (ValueError, TypeError):
+                        pass
+        
+        # 构造转换后的文档
+        pivoted_doc = dict(document)
+        pivoted_raw_data = {}
+        
+        for statement_type in ['income_statement', 'balance_sheet', 'cashflow_statement', 'financial_indicators']:
+            statement_records = []
+            for period in sorted(date_columns, reverse=True):
+                if statement_type in periods_data[period]:
+                    record = dict(periods_data[period][statement_type])
+                    record['end_date'] = period
+                    record['report_period'] = period
+                    statement_records.append(record)
+            
+            if statement_records:
+                pivoted_raw_data[statement_type] = statement_records
+        
+        pivoted_doc['raw_data'] = pivoted_raw_data
+        return pivoted_doc
+    
+    def _aggregate_periods_to_financial_data(self, periods: list) -> dict:
+        """将展开的按期记录聚合回财务数据格式"""
+        if not periods:
+            return {}
+        
+        # 按报告期分组，将各期的分项数据聚合到对应列表
+        income_statements = []
+        balance_sheets = []
+        cash_flows = []
+        financial_indicators = []
+        
+        for period_record in periods:
+            report_period = period_record.get('report_period') or period_record.get('report_date')
+            if not report_period:
+                continue
+            
+            # 从 raw_data 中提取各报表
+            raw_data = period_record.get('raw_data', {})
+            
+            # 利润表
+            if 'income_statement' in raw_data and raw_data['income_statement']:
+                income_stmt = dict(raw_data['income_statement'])
+                income_stmt['end_date'] = report_period
+                income_stmt['report_period'] = report_period
+                if 'ann_date' not in income_stmt and period_record.get('ann_date'):
+                    income_stmt['ann_date'] = period_record['ann_date']
+                income_statements.append(income_stmt)
+            
+            # 资产负债表
+            if 'balance_sheet' in raw_data and raw_data['balance_sheet']:
+                balance = dict(raw_data['balance_sheet'])
+                balance['end_date'] = report_period
+                balance['report_period'] = report_period
+                if 'ann_date' not in balance and period_record.get('ann_date'):
+                    balance['ann_date'] = period_record['ann_date']
+                balance_sheets.append(balance)
+            
+            # 现金流量表
+            if 'cashflow_statement' in raw_data and raw_data['cashflow_statement']:
+                cashflow = dict(raw_data['cashflow_statement'])
+                cashflow['end_date'] = report_period
+                cashflow['report_period'] = report_period
+                if 'ann_date' not in cashflow and period_record.get('ann_date'):
+                    cashflow['ann_date'] = period_record['ann_date']
+                cash_flows.append(cashflow)
+            
+            # 财务指标
+            if 'financial_indicators' in raw_data and raw_data['financial_indicators']:
+                indicator = dict(raw_data['financial_indicators'])
+                indicator['end_date'] = report_period
+                indicator['report_period'] = report_period
+                if 'ann_date' not in indicator and period_record.get('ann_date'):
+                    indicator['ann_date'] = period_record['ann_date']
+                financial_indicators.append(indicator)
+        
+        return {
+            'income_statement': income_statements,
+            'balance_sheet': balance_sheets,
+            'cash_flow': cash_flows,
+            'main_indicators': financial_indicators,
+        }
 
     def _get_cached_stock_info(self, symbol: str) -> dict:
         """从数据库缓存获取股票基本信息"""
@@ -2410,6 +2592,8 @@ def _add_financial_cache_methods():
     OptimizedChinaDataProvider._get_cached_stock_info = _get_cached_stock_info
     OptimizedChinaDataProvider._restore_financial_data_format = _restore_financial_data_format
     OptimizedChinaDataProvider._cache_raw_financial_data = _cache_raw_financial_data
+    OptimizedChinaDataProvider._pivot_akshare_wide_table = _pivot_akshare_wide_table
+    OptimizedChinaDataProvider._aggregate_periods_to_financial_data = _aggregate_periods_to_financial_data
 
 # 执行方法添加
 _add_financial_cache_methods()
